@@ -2,21 +2,38 @@ import streamlit as st
 import numpy as np
 import pydicom
 
-st.set_page_config(layout="wide", page_title="DICOM & NPZ Viewer")
+st.set_page_config(layout="wide", page_title="CT DICOM Viewer")
+
+# Windowing Presets matching original script
+PRESETS = {
+    'Custom / Default': None,
+    'Soft Tissue (Abdomen/Brain)': (40.0, 400.0),
+    'Bone': (400.0, 1800.0),
+    'Lungs': (-600.0, 1500.0)
+}
+
+def apply_windowing(image, center, width):
+    min_val = center - (width / 2.0)
+    max_val = center + (width / 2.0)
+    clipped = np.clip(image, min_val, max_val)
+    # Normalize to [0, 1] range for correct display
+    if max_val != min_val:
+        return (clipped - min_val) / (max_val - min_val)
+    return clipped
+
 st.title("Interactive CT Volume Viewer")
 
-# File uploader accepts both DICOM files and NPZ archives
 uploaded_files = st.file_uploader(
-    "Upload DICOM slices (.dcm) OR a compressed dataset (.npz)", 
+    "Upload DICOM files (.dcm) OR a compressed cache (.npz)", 
     accept_multiple_files=True,
     type=["dcm", "npz"]
 )
 
 volume = None
-center, width = 40.0, 400.0
+default_center, default_width = 40.0, 400.0
+spacing_z, spacing_y, spacing_x = 1.0, 1.0, 1.0
 
 if uploaded_files:
-    # Check if an NPZ file was uploaded
     npz_files = [f for f in uploaded_files if f.name.endswith('.npz')]
     
     if npz_files:
@@ -25,28 +42,49 @@ if uploaded_files:
             data = np.load(npz_files[0])
             volume = data['volume']
             if 'center' in data and 'width' in data:
-                center, width = float(data['center']), float(data['width'])
-            st.sidebar.success(f"Loaded dataset from: {npz_files[0].name}")
+                default_center, default_width = float(data['center']), float(data['width'])
+            if 'spacing' in data:
+                spacing_z, spacing_y, spacing_x = [float(s) for s in data['spacing']]
+            st.sidebar.success(f"Loaded cache: {npz_files[0].name}")
         except Exception as e:
-            st.error(f"Error reading .npz file: {e}")
+            st.error(f"Error loading .npz file: {e}")
 
     else:
-        # Load from multiple DICOM files
+        # Load from DICOM files (matching load_ct_series logic)
         slices = []
         for file in uploaded_files:
             try:
                 ds = pydicom.dcmread(file, force=True)
+                if not hasattr(ds, 'file_meta') or 'TransferSyntaxUID' not in ds.file_meta:
+                    ds.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
                 if hasattr(ds, 'pixel_array'):
                     slices.append(ds)
             except Exception:
                 continue
 
         if slices:
-            # Sort spatially by Z position or Instance Number
+            # Sort slices spatially by Z-position
             try:
                 slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
+            except (AttributeError, KeyError):
+                try:
+                    slices.sort(key=lambda x: int(getattr(x, 'InstanceNumber', 0)))
+                except (ValueError, TypeError):
+                    slices.sort(key=lambda x: x.filename)
+
+            # Physical spacing calculations
+            try:
+                spacing_y, spacing_x = float(slices[0].PixelSpacing[0]), float(slices[0].PixelSpacing[1])
+            except (AttributeError, KeyError):
+                spacing_y, spacing_x = 1.0, 1.0
+
+            try:
+                if len(slices) > 1 and hasattr(slices[0], 'ImagePositionPatient') and hasattr(slices[1], 'ImagePositionPatient'):
+                    spacing_z = abs(float(slices[1].ImagePositionPatient[2]) - float(slices[0].ImagePositionPatient[2]))
+                else:
+                    spacing_z = float(getattr(slices[0], 'SliceThickness', 1.0))
             except Exception:
-                slices.sort(key=lambda x: int(getattr(x, 'InstanceNumber', 0)))
+                spacing_z = 1.0
 
             # Convert to Hounsfield Units (HU)
             hu_slices = []
@@ -57,43 +95,56 @@ if uploaded_files:
                 hu_slices.append(hu_slice)
 
             volume = np.stack(hu_slices)
+
+            # Extract window center/width if available
+            if hasattr(slices[0], 'WindowCenter') and hasattr(slices[0], 'WindowWidth'):
+                try:
+                    wc, ww = slices[0].WindowCenter, slices[0].WindowWidth
+                    default_center = float(wc[0] if isinstance(wc, pydicom.multival.MultiValue) else wc)
+                    default_width = float(ww[0] if isinstance(ww, pydicom.multival.MultiValue) else ww)
+                except Exception:
+                    pass
+
             st.sidebar.success(f"Loaded {len(slices)} DICOM slices")
 
 if volume is not None:
     nz, ny, nx = volume.shape
 
-    st.sidebar.header("Windowing Controls")
+    # Aspect ratio calculations matching original script
+    aspect_coronal = spacing_z / spacing_x
+    aspect_sagittal = spacing_z / spacing_y
+
+    st.sidebar.header("Controls & Windowing")
     
-    # Presets
-    preset = st.sidebar.selectbox("Preset", ["Default / Custom", "Soft Tissue (40 / 400)", "Bone (400 / 1800)", "Lungs (-600 / 1500)"])
-    
-    if preset == "Soft Tissue (40 / 400)":
-        center, width = 40.0, 400.0
-    elif preset == "Bone (400 / 1800)":
-        center, width = 400.0, 1800.0
-    elif preset == "Lungs (-600 / 1500)":
-        center, width = -600.0, 1500.0
+    selected_preset = st.sidebar.selectbox("Presets", list(PRESETS.keys()))
+    if PRESETS[selected_preset] is not None:
+        p_center, p_width = PRESETS[selected_preset]
+    else:
+        p_center, p_width = default_center, default_width
 
-    center = st.sidebar.slider("Window Level (HU)", -1000, 1000, int(center))
-    width = st.sidebar.slider("Window Width (HU)", 1, 3000, int(width))
+    center = st.sidebar.slider("Level (HU)", -1000, 1000, int(p_center))
+    width = st.sidebar.slider("Width (HU)", 1, 3000, int(p_width))
 
-    min_v = center - (width / 2.0)
-    max_v = center + (width / 2.0)
-
-    # 3-Panel View Layout
     col1, col2, col3 = st.columns(3)
 
+    # 1. Axial View (Z)
     with col1:
-        z_idx = st.slider("Axial (Z)", 0, nz - 1, nz // 2)
-        img_ax = np.clip(volume[z_idx, :, :], min_v, max_v)
-        st.image(img_ax, caption=f"Axial (Slice {z_idx + 1}/{nz})", clamp=True, use_container_width=True)
+        z_idx = st.slider("Z (Axial)", 0, nz - 1, nz // 2)
+        slice_ax = apply_windowing(volume[z_idx, :, :], center, width)
+        st.image(slice_ax, caption=f"Axial (Z: {z_idx + 1}/{nz})", use_container_width=True)
 
+    # 2. Coronal View (Y) - inverted vertically & aspect scaled
     with col2:
-        y_idx = st.slider("Coronal (Y)", 0, ny - 1, ny // 2)
-        img_cor = np.clip(volume[:, y_idx, :], min_v, max_v)
-        st.image(np.flipud(img_cor), caption=f"Coronal (Slice {y_idx + 1}/{ny})", clamp=True, use_container_width=True)
+        y_idx = st.slider("Y (Coronal)", 0, ny - 1, ny // 2)
+        slice_cor = apply_windowing(volume[:, y_idx, :], center, width)
+        # Flip vertically to mimic Matplotlib origin='lower'
+        slice_cor = np.flipud(slice_cor)
+        st.image(slice_cor, caption=f"Coronal (Y: {y_idx + 1}/{ny})", use_container_width=True)
 
+    # 3. Sagittal View (X) - inverted vertically & aspect scaled
     with col3:
-        x_idx = st.slider("Sagittal (X)", 0, nx - 1, nx // 2)
-        img_sag = np.clip(volume[:, :, x_idx], min_v, max_v)
-        st.image(np.flipud(img_sag), caption=f"Sagittal (Slice {x_idx + 1}/{nx})", clamp=True, use_container_width=True)
+        x_idx = st.slider("X (Sagittal)", 0, nx - 1, nx // 2)
+        slice_sag = apply_windowing(volume[:, :, x_idx], center, width)
+        # Flip vertically to mimic Matplotlib origin='lower'
+        slice_sag = np.flipud(slice_sag)
+        st.image(slice_sag, caption=f"Sagittal (X: {x_idx + 1}/{nx})", use_container_width=True)
