@@ -1,10 +1,10 @@
 import streamlit as st
 import numpy as np
 import pydicom
-from scipy.ndimage import zoom
 
 st.set_page_config(layout="wide", page_title="CT DICOM Viewer")
 
+# Windowing Presets matching original script
 PRESETS = {
     'Custom / Default': None,
     'Soft Tissue (Abdomen/Brain)': (40.0, 400.0),
@@ -16,6 +16,7 @@ def apply_windowing(image, center, width):
     min_val = center - (width / 2.0)
     max_val = center + (width / 2.0)
     clipped = np.clip(image, min_val, max_val)
+    # Normalize to [0, 1] range for correct display
     if max_val != min_val:
         return (clipped - min_val) / (max_val - min_val)
     return clipped
@@ -36,6 +37,7 @@ if uploaded_files:
     npz_files = [f for f in uploaded_files if f.name.endswith('.npz')]
     
     if npz_files:
+        # Load directly from .npz file
         try:
             data = np.load(npz_files[0])
             volume = data['volume']
@@ -48,6 +50,7 @@ if uploaded_files:
             st.error(f"Error loading .npz file: {e}")
 
     else:
+        # Load from DICOM files (matching load_ct_series logic)
         slices = []
         for file in uploaded_files:
             try:
@@ -60,6 +63,7 @@ if uploaded_files:
                 continue
 
         if slices:
+            # Sort slices spatially by Z-position
             try:
                 slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
             except (AttributeError, KeyError):
@@ -68,6 +72,7 @@ if uploaded_files:
                 except (ValueError, TypeError):
                     slices.sort(key=lambda x: x.filename)
 
+            # Physical spacing calculations
             try:
                 spacing_y, spacing_x = float(slices[0].PixelSpacing[0]), float(slices[0].PixelSpacing[1])
             except (AttributeError, KeyError):
@@ -81,6 +86,7 @@ if uploaded_files:
             except Exception:
                 spacing_z = 1.0
 
+            # Convert to Hounsfield Units (HU)
             hu_slices = []
             for s in slices:
                 slope = float(getattr(s, 'RescaleSlope', 1))
@@ -90,6 +96,7 @@ if uploaded_files:
 
             volume = np.stack(hu_slices)
 
+            # Extract window center/width if available
             if hasattr(slices[0], 'WindowCenter') and hasattr(slices[0], 'WindowWidth'):
                 try:
                     wc, ww = slices[0].WindowCenter, slices[0].WindowWidth
@@ -103,7 +110,7 @@ if uploaded_files:
 if volume is not None:
     nz, ny, nx = volume.shape
 
-    # Calculate exact vertical scaling multipliers relative to horizontal pixel width
+    # Aspect ratio calculations matching original script
     aspect_coronal = spacing_z / spacing_x
     aspect_sagittal = spacing_z / spacing_y
 
@@ -120,32 +127,24 @@ if volume is not None:
 
     col1, col2, col3 = st.columns(3)
 
-    # 1. Axial View (Z) - Standard pixel grid
+    # 1. Axial View (Z)
     with col1:
         z_idx = st.slider("Z (Axial)", 0, nz - 1, nz // 2)
         slice_ax = apply_windowing(volume[z_idx, :, :], center, width)
         st.image(slice_ax, caption=f"Axial (Z: {z_idx + 1}/{nz})", use_container_width=True)
 
-    # 2. Coronal View (Y) - Rescaled vertically by aspect_coronal
+    # 2. Coronal View (Y) - inverted vertically & aspect scaled
     with col2:
         y_idx = st.slider("Y (Coronal)", 0, ny - 1, ny // 2)
         slice_cor = apply_windowing(volume[:, y_idx, :], center, width)
+        # Flip vertically to mimic Matplotlib origin='lower'
         slice_cor = np.flipud(slice_cor)
-        
-        # Resample array height to match real physical aspect ratio
-        if aspect_coronal != 1.0:
-            slice_cor = zoom(slice_cor, (aspect_coronal, 1.0), order=1)
-            
         st.image(slice_cor, caption=f"Coronal (Y: {y_idx + 1}/{ny})", use_container_width=True)
 
-    # 3. Sagittal View (X) - Rescaled vertically by aspect_sagittal
+    # 3. Sagittal View (X) - inverted vertically & aspect scaled
     with col3:
         x_idx = st.slider("X (Sagittal)", 0, nx - 1, nx // 2)
         slice_sag = apply_windowing(volume[:, :, x_idx], center, width)
+        # Flip vertically to mimic Matplotlib origin='lower'
         slice_sag = np.flipud(slice_sag)
-        
-        # Resample array height to match real physical aspect ratio
-        if aspect_sagittal != 1.0:
-            slice_sag = zoom(slice_sag, (aspect_sagittal, 1.0), order=1)
-            
         st.image(slice_sag, caption=f"Sagittal (X: {x_idx + 1}/{nx})", use_container_width=True)
